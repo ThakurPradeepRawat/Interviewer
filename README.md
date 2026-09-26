@@ -1,111 +1,233 @@
 # Agentic AI Interview Assistant
 
-Automates technical interview evaluation end to end: parses a resume,
-runs a multi-turn interview with an agentic planner → evaluator → critic
-loop, executes candidate-submitted code in a sandbox, and scores every
-answer with a structured rubric via OpenAI function calling.
+**An automated technical interview platform.** Parses a resume, runs a multi-turn
+interview through an agentic planner → evaluator → critic loop, executes
+candidate-submitted code in a sandbox, and scores every answer against a
+structured rubric — all served through a FastAPI backend backed by
+PostgreSQL and Redis.
+
+![Python](https://img.shields.io/badge/python-3.11-blue)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688)
+![LangGraph](https://img.shields.io/badge/LangGraph-multi--agent-6f42c1)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-336791)
+![Redis](https://img.shields.io/badge/Redis-7-DC382D)
+![License](https://img.shields.io/badge/license-MIT-lightgrey)
+
+---
+
+## Table of Contents
+
+- [Why this exists](#why-this-exists)
+- [Architecture](#architecture)
+- [Design decisions](#design-decisions)
+- [Tech stack](#tech-stack)
+- [Project structure](#project-structure)
+- [Getting started](#getting-started)
+- [Configuration](#configuration)
+- [API reference](#api-reference)
+- [Load testing](#load-testing)
+- [Known limitations](#known-limitations)
+- [Roadmap](#roadmap)
+- [Contributing](#contributing)
+- [License](#license)
+
+---
+
+## Why this exists
+
+Manual technical screening doesn't scale, and free-text LLM grading is
+unreliable — ask the same model to "rate this answer" twice and you'll get
+two different rationales in two different shapes. This project treats
+interview evaluation as a **structured extraction problem**, not a
+conversation: every score is produced through OpenAI function calling
+against a fixed schema, every question is proposed by an agent that has
+seen the candidate's actual skill set and prior performance, and every
+session survives request restarts and cache evictions because Postgres —
+not the graph's in-memory state — is the source of truth.
 
 ## Architecture
 
 ```mermaid
-flowchart LR
-    A[Resume upload] -->|extract text| B[OpenAI function calling
-    extract_candidate_profile]
-    B --> C[(PostgreSQL
-    candidates)]
+flowchart TB
+    subgraph Ingestion
+        A[Resume upload
+        PDF / DOCX / TXT] -->|extract text| B[OpenAI function calling
+        extract_candidate_profile]
+        B --> C[(PostgreSQL
+        candidates)]
+    end
 
-    D[Start interview] --> E[Planner
-    generates question]
-    E --> F[(Postgres: session + turn)]
-    E --> G[(Redis: hot session state)]
+    subgraph "Interview loop — LangGraph"
+        D[POST /interviews/start] --> E[Planner
+        proposes next question]
+        E --> F[(Postgres: session + turn)]
+        E --> G[(Redis: hot session state
+        TTL-bound cache)]
 
-    H[Candidate answer / code] --> I{Code submitted?}
-    I -->|yes| J[Sandboxed executor
-    subprocess, timeout, blocked imports]
-    I -->|no| K[Evaluator node
-    OpenAI function calling]
-    J --> K
-    K --> L[Critic node
-    follow-up / next topic / end]
-    L -->|continue| E
-    L -->|end| M[Interview report
-    aggregated score]
+        H[POST .../answer] --> I{Code submitted?}
+        I -->|yes| J[Sandboxed executor
+        subprocess · rlimits · blocked imports]
+        I -->|no| K[Evaluator node
+        OpenAI function calling → rubric]
+        J --> K
+        K --> L[Critic node
+        follow-up / next topic / end]
+        L -->|continue| E
+        L -->|end| M[GET .../report
+        aggregated score]
+    end
 ```
 
-- **Planner** — proposes the next question, adapting to the candidate's
-  resume skills and to which prior answers scored poorly.
-- **Evaluator** — scores an answer (and code output, if any) against a
-  structured rubric (`correctness`, `clarity`, `depth`, `feedback`,
-  `follow_up_needed`) using OpenAI **function calling**, not free-text
-  parsing — the model is forced to return a schema-valid object.
-- **Critic** — reads the evaluation and routes to a follow-up probe on the
-  same topic, a fresh topic, or interview completion.
-- Planner + Evaluator + Critic are wired together with **LangGraph**
-  (`app/interview_graph.py`); the evaluate → critic step is a compiled
-  `StateGraph`.
-- **Redis** caches the live session state (candidate profile, question
-  history, running score) so each turn is a cache read instead of a full
-  Postgres history rebuild — this is what lets many concurrent multi-turn
-  sessions run without hammering the DB. **Postgres** remains the source of
-  truth; if a cache entry expires mid-interview, state rebuilds from
-  Postgres transparently (see `_rebuild_state_from_db`).
-- **Code execution** runs candidate code in an isolated subprocess with a
-  CPU/memory/time limit and a blocked-imports list — see the safety note in
-  `app/code_executor.py` for what this is (and isn't) safe for.
+**Request flow for one answer:**
 
-## Project layout
+1. Client `POST`s an answer (text and/or code) to `/interviews/{id}/answer`.
+2. If code was submitted, it runs in an isolated subprocess first; its
+   stdout/stderr/exit code are fed into evaluation as evidence.
+3. The **evaluator** node calls OpenAI with `tool_choice` forced to
+   `record_evaluation` — the model cannot return anything except a
+   schema-valid object with `correctness`, `clarity`, `depth`, `feedback`,
+   and `follow_up_needed`.
+4. The **critic** node reads that evaluation and decides: probe the same
+   topic again, move to a new one, or end the interview (turn budget
+   exhausted).
+5. State is written to Postgres (durability) and Redis (fast reads for the
+   next turn) before the response returns.
+
+## Design decisions
+
+A few choices here are deliberate trade-offs, not defaults — documented so
+a reviewer doesn't have to guess the reasoning:
+
+| Decision | Rationale | Trade-off accepted |
+|---|---|---|
+| Structured scoring via **function calling**, not prompt-and-parse | Deterministic shape, no regex/JSON-repair on LLM output | Slightly more prompt engineering up front |
+| **Redis is a cache, not the source of truth** | Postgres survives cache eviction / restarts; Redis just avoids rebuilding full history on every turn | Extra code path (`_rebuild_state_from_db`) to keep in sync |
+| Graph is **not** run start-to-finish in one `ainvoke` | A real interview must pause between "ask" and "answer" across an HTTP round trip | Planner and evaluator/critic are invoked separately per turn, coordinated by the router, instead of one continuous LangGraph run |
+| Code sandbox is **subprocess + rlimits**, not a VM/container-per-run | Good enough for trusted/low-stakes evaluation with near-zero infra | Explicitly *not* safe for arbitrary untrusted internet users — see [Known limitations](#known-limitations) |
+| Tables auto-created on startup (`init_models`) | Fast local iteration | Not a substitute for Alembic migrations in any real deployment |
+
+## Tech stack
+
+| Layer | Choice | Why |
+|---|---|---|
+| API framework | FastAPI | Async-native, Pydantic validation, OpenAPI docs for free |
+| Agent orchestration | LangGraph | Explicit state machine for planner/evaluator/critic instead of ad-hoc prompt chaining |
+| LLM | OpenAI API (function calling) | Schema-enforced structured output |
+| Persistent store | PostgreSQL (async, SQLAlchemy 2.0) | Relational integrity for candidates → sessions → turns |
+| Session cache | Redis | Sub-millisecond reads for hot multi-turn state |
+| Code execution | Python subprocess + `resource` limits | Isolation without container-per-request overhead |
+| Load testing | Locust | Simulates full start → answer × N → report flows per virtual user |
+
+## Project structure
 
 ```
 app/
-  main.py              FastAPI app, startup hook
-  config.py            Settings (env-driven)
-  database.py          Async SQLAlchemy engine/session
-  models.py            Candidate / InterviewSession / InterviewTurn
-  schemas.py           Pydantic request/response models
-  redis_client.py      Session state cache
-  resume_parser.py     PDF/DOCX text extraction + OpenAI structured parsing
-  code_executor.py      Sandboxed Python execution
-  interview_graph.py   LangGraph planner/evaluator/critic
-  routers/
-    resume.py          POST /resumes/parse
-    interview.py        POST /interviews/start, /interviews/{id}/answer, GET /interviews/{id}/report
-locustfile.py           Load test (start -> 3 turns -> report, per virtual user)
-docker-compose.yml      Postgres + Redis + API
+├── main.py              FastAPI app assembly, startup hook (table creation)
+├── config.py            Settings, loaded from environment / .env
+├── database.py          Async SQLAlchemy engine, session factory
+├── models.py            Candidate, InterviewSession, InterviewTurn (ORM)
+├── schemas.py           Pydantic request/response contracts
+├── redis_client.py      Session-state cache (get/set/drop, TTL-bound)
+├── resume_parser.py     PDF/DOCX text extraction + structured parsing
+├── code_executor.py     Sandboxed Python execution
+├── interview_graph.py   LangGraph: planner, evaluator node, critic node
+└── routers/
+    ├── resume.py        POST /resumes/parse
+    └── interview.py     POST /interviews/start
+                          POST /interviews/{id}/answer
+                          GET  /interviews/{id}/report
+locustfile.py             Load test: start → 3 turns → report, per user
+docker-compose.yml         Postgres + Redis + API
+Dockerfile
+requirements.txt
+.env.example
 ```
 
-## Setup
+## Getting started
+
+### Prerequisites
+- Python 3.11+
+- Docker (for Postgres + Redis) — or point `DATABASE_URL` / `REDIS_URL` at
+  existing instances
+- An OpenAI API key
+
+### Setup
 
 ```bash
-cp .env.example .env        # add your OPENAI_API_KEY
+git clone <this-repo>
+cd interview_assistant
+
+cp .env.example .env        # then set OPENAI_API_KEY
 docker compose up -d postgres redis
+
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+
 uvicorn app.main:app --reload
 ```
 
-Tables are auto-created on startup for local development. For anything
-beyond a demo, replace `init_models()` with real Alembic migrations.
+Interactive API docs: `http://localhost:8000/docs`
 
-## API walkthrough
+### Running with Docker Compose (API included)
 
 ```bash
-# 1. Parse a resume
-curl -F "file=@resume.pdf" http://localhost:8000/resumes/parse
-# -> {"candidate_id": "...", "profile": {...}}
-
-# 2. Start an interview
-curl -X POST http://localhost:8000/interviews/start \
-  -H "Content-Type: application/json" \
-  -d '{"candidate_id": "<id>", "role": "Backend Software Engineer"}'
-# -> {"session_id": "...", "question": "...", "question_type": "coding", ...}
-
-# 3. Answer (text or code)
-curl -X POST http://localhost:8000/interviews/<session_id>/answer \
-  -H "Content-Type: application/json" \
-  -d '{"code": "print(sum(range(10)))"}'
-
-# 4. Get the final report
-curl http://localhost:8000/interviews/<session_id>/report
+docker compose up --build
 ```
+
+## Configuration
+
+All settings are environment-driven (`app/config.py`, backed by
+`pydantic-settings`):
+
+| Variable | Default | Description |
+|---|---|---|
+| `OPENAI_API_KEY` | — | Required. No fallback — the app will fail fast without it in real use. |
+| `OPENAI_MODEL` | `gpt-4o-mini` | Model used for parsing, planning, and evaluation |
+| `DATABASE_URL` | `postgresql+asyncpg://interview:interview@localhost:5432/interview_assistant` | Async SQLAlchemy DSN |
+| `REDIS_URL` | `redis://localhost:6379/0` | Session cache connection |
+| `SESSION_TTL_SECONDS` | `3600` | How long a cached session survives inactivity |
+| `MAX_QUESTIONS_PER_INTERVIEW` | `6` | Turn budget before the interview auto-completes |
+| `CODE_EXEC_TIMEOUT_SECONDS` | `5` | Hard wall-clock + CPU limit per code submission |
+
+## API reference
+
+### `POST /resumes/parse`
+Multipart file upload (`.pdf`, `.docx`, `.txt`). Extracts text, then uses
+OpenAI function calling to extract a structured profile.
+
+```bash
+curl -F "file=@resume.pdf" http://localhost:8000/resumes/parse
+```
+```json
+{
+  "candidate_id": "b3f1...",
+  "profile": { "name": "...", "email": "...", "years_experience": 1.5, "skills": ["Python", "FastAPI", "Redis"] }
+}
+```
+
+### `POST /interviews/start`
+```json
+{ "candidate_id": "b3f1...", "role": "Backend Software Engineer" }
+```
+Returns the first question, already persisted to Postgres and cached in Redis.
+
+### `POST /interviews/{session_id}/answer`
+```json
+{ "answer": "I'd use a write-through cache in front of Postgres." }
+```
+or, for a coding question:
+```json
+{ "code": "def two_sum(nums, target): ..." }
+```
+Returns the structured evaluation for that turn, the code execution result
+(if applicable), and either the next question or a `completed` status.
+
+### `GET /interviews/{session_id}/report`
+Returns every turn (question, answer, code, evaluation) plus the aggregated
+`overall_score` once the interview is complete.
+
+Full request/response schemas are in `app/schemas.py` and auto-documented at
+`/docs`.
 
 ## Load testing
 
@@ -114,19 +236,44 @@ locust -f locustfile.py --host http://localhost:8000 \
        --users 120 --spawn-rate 10 --run-time 5m --headless --csv=results
 ```
 
-Each simulated user runs a full start → 3 answers → report cycle, so 100+
-concurrent Locust users approximates 100+ concurrent multi-turn sessions.
-Expect OpenAI API latency to dominate the p99, not FastAPI/Redis/Postgres —
-size your `--users` and check `results_stats.csv` against your target
-throughput/latency numbers.
+Each virtual user runs a full `start → 3 answers → report` cycle end to
+end, so 100+ concurrent Locust users approximates 100+ concurrent
+multi-turn interview sessions. In practice, OpenAI API latency dominates
+p99, not FastAPI/Redis/Postgres overhead — profile `results_stats.csv`
+accordingly before assuming a bottleneck is in this codebase.
 
-## Known limitations (be ready to discuss these in an interview)
+## Known limitations
 
-- Code execution sandbox is subprocess-based with resource limits and a
-  blocked-imports list — good for a demo/portfolio, not hardened enough for
-  arbitrary untrusted users at scale (would want gVisor/Firecracker or a
-  hosted execution API for that).
-- `init_models()` auto-creates tables for convenience; a real deployment
-  needs Alembic migrations.
-- The planner/evaluator prompts are intentionally simple — no retrieval over
-  a question bank yet, so questions can occasionally repeat in phrasing.
+Stated explicitly rather than discovered in review:
+
+- **Code sandbox is subprocess-based**, not container- or VM-isolated.
+  Suitable for trusted or low-stakes evaluation; not hardened for
+  arbitrary untrusted users at scale. A production version would use
+  gVisor, Firecracker microVMs, or a hosted execution API.
+- **No database migrations.** `init_models()` calls `create_all()` on
+  startup for local-dev convenience. Any real deployment needs Alembic.
+- **No retrieval over a curated question bank.** The planner generates
+  questions from a prompt, not from a vetted, deduplicated question store —
+  phrasing can occasionally repeat across sessions.
+- **No authentication/authorization layer.** Every endpoint is open; this
+  is an evaluation engine, not a deployable multi-tenant product as-is.
+- **Single-region, single-instance assumptions.** No multi-region Redis or
+  read-replica routing for Postgres — fine at demo scale, not at real
+  production scale.
+
+## Roadmap
+
+- [ ] Alembic migrations
+- [ ] Auth (API keys or OAuth2) per interviewer/organization
+- [ ] Curated + versioned question bank with retrieval, instead of pure generation
+- [ ] Streaming responses (SSE) for question generation and evaluation feedback
+- [ ] Container-based code execution for untrusted submissions
+
+## Contributing
+
+Issues and PRs welcome. For anything nontrivial, open an issue first
+describing the change so we can agree on approach before code is written.
+
+## License
+
+MIT — see `LICENSE`.
